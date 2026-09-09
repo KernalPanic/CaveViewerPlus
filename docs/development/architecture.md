@@ -737,6 +737,12 @@ windows legible without requiring user-provided environment variables.
 `CaveViewerWindow` is the OpenGL boundary: it owns the context, framebuffer
 resources, shader/program calls, and GPU uploads on the render thread. Its
 non-GL session ordering is deliberately delegated to focused coordinators.
+Each public viewer launcher snapshots its inputs in an immutable
+`gui.viewer_session.ViewerSessionConfig`; mutable completion state belongs to
+that launch's `ViewerSession`. A short-lived ModernGL configuration subclass
+binds the session to the class-based backend API, so the reusable
+`CaveViewerWindow` class never carries map, benchmark, runtime, or outcome
+state between native-window runs.
 `gui.viewer_frame_scheduler` selects the iconified, capture-finalization,
 import, startup, or interactive frame phase and owns non-blocking throttles.
 `gui.viewer_capture_workflow` owns cross-capture exit finalization and overlay

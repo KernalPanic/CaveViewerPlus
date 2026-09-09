@@ -35,6 +35,30 @@ from caveviewer.gui.platform.runtime import VideoRecordingPreflight, ViewerLaunc
 from caveviewer.gui.platform.viewer_launch import ViewerLaunchError
 
 
+def _viewer_session(*, platform_runtime=None):
+    return viewer_window.ViewerSession(
+        viewer_window.ViewerSessionConfig(
+            mode=viewer_window.ViewerLaunchMode.READY_CACHE,
+            cache_dir="/cache",
+            textures_dir="/textures",
+            manifest={"chunks": {}},
+            platform_runtime=platform_runtime,
+        )
+    )
+
+
+def _pending_import_session():
+    return viewer_window.ViewerSession(
+        viewer_window.ViewerSessionConfig(
+            mode=viewer_window.ViewerLaunchMode.PENDING_IMPORT,
+            pending_import=viewer_window.PendingImportRequest(
+                model_descriptor={"obj_path": "/maps/cave.obj"},
+                textures_dir="/maps",
+            ),
+        )
+    )
+
+
 def test_viewer_default_framebuffer_uses_multisampling_for_graphics_edges():
     assert viewer_window.CaveViewerWindow.samples == 4
 
@@ -245,6 +269,7 @@ class FakeImportThread:
 
 def _import_window():
     window = object.__new__(viewer_window.CaveViewerWindow)
+    window._viewer_session = _pending_import_session()
     window._import_active = False
     window._import_is_startup = False
     window._import_thread = None
@@ -3021,16 +3046,41 @@ def test_linux_launch_defers_sizing_to_glfw_workarea(monkeypatch):
         lambda _preflight: target,
     )
 
-    viewer_window._launch_viewer_window()
+    session = _viewer_session()
+    viewer_window._launch_viewer_window(session)
 
     assert viewer_window.CaveViewerWindow.window_size == (1600, 1000)
     assert calls[0][0] is target
     request = calls[0][1]
-    assert request.config_class is viewer_window.CaveViewerWindow
+    assert request.config_class is not viewer_window.CaveViewerWindow
+    assert issubclass(request.config_class, viewer_window.CaveViewerWindow)
+    assert request.config_class._viewer_session is session
+    assert request.config_class.window_size == (1600, 1000)
     assert request.runner is viewer_window._run_moderngl_window_config
     assert request.window_size_fraction == 0.8
     assert request.fallback_window_size == (1600, 1000)
     assert request.force_resizable_window is True
+
+
+def test_session_window_config_classes_keep_sequential_launches_isolated():
+    first_session = _viewer_session()
+    second_session = _pending_import_session()
+
+    first_config = viewer_window._session_window_config_class(
+        first_session,
+        window_size=(800, 600),
+    )
+    second_config = viewer_window._session_window_config_class(
+        second_session,
+        window_size=(1200, 900),
+    )
+
+    assert first_config is not second_config
+    assert first_config._viewer_session is first_session
+    assert first_config.window_size == (800, 600)
+    assert second_config._viewer_session is second_session
+    assert second_config.window_size == (1200, 900)
+    assert not hasattr(viewer_window.CaveViewerWindow, "_viewer_session")
 
 
 def test_viewer_launch_uses_injected_runtime_presentation_profile(monkeypatch):
@@ -3052,13 +3102,12 @@ def test_viewer_launch_uses_injected_runtime_presentation_profile(monkeypatch):
             route=target.route_key,
         ),
     )
-    previous_runtime = viewer_window.CaveViewerWindow.cave_platform_runtime
     window_backend_adapter = SimpleNamespace(
         launch_viewer=lambda launch_target, request: calls.append(
             (launch_target, request)
         )
     )
-    viewer_window.CaveViewerWindow.cave_platform_runtime = SimpleNamespace(
+    runtime = SimpleNamespace(
         presentation_profile=select_presentation_profile(platform_name="linux"),
         viewer_launch_preflight=lambda: preflight,
         window_backend_adapter=window_backend_adapter,
@@ -3074,10 +3123,7 @@ def test_viewer_launch_uses_injected_runtime_presentation_profile(monkeypatch):
         lambda received_preflight: target if received_preflight is preflight else None,
     )
 
-    try:
-        viewer_window._launch_viewer_window()
-    finally:
-        viewer_window.CaveViewerWindow.cave_platform_runtime = previous_runtime
+    viewer_window._launch_viewer_window(_viewer_session(platform_runtime=runtime))
 
     assert calls[0][0] is target
     assert calls[0][1].window_size_fraction == 0.8
@@ -3110,7 +3156,7 @@ def test_viewer_launch_refuses_disabled_preflight_before_window_execution(monkey
     )
 
     with pytest.raises(ViewerLaunchError, match="no supported display"):
-        viewer_window._launch_viewer_window()
+        viewer_window._launch_viewer_window(_viewer_session())
 
 
 def test_run_viewer_forwards_map_root_to_the_deferred_window_load(
@@ -3127,11 +3173,11 @@ def test_run_viewer_forwards_map_root_to_the_deferred_window_load(
     monkeypatch.setattr(
         viewer_window,
         "_launch_viewer_window",
-        lambda: launched.append(
+        lambda session: launched.append(
             (
-                viewer_window.CaveViewerWindow.cave_cache_dir,
-                viewer_window.CaveViewerWindow.cave_textures_dir,
-                viewer_window.CaveViewerWindow.cave_map_root,
+                session.config.cache_dir,
+                session.config.textures_dir,
+                session.config.map_root,
             )
         ),
     )
@@ -3145,19 +3191,17 @@ def test_run_viewer_forwards_map_root_to_the_deferred_window_load(
     assert launched == [
         (str(cache_dir), str(cache_dir), str(map_root.resolve()))
     ]
-    assert viewer_window.CaveViewerWindow.cave_map_root is None
+    assert not hasattr(viewer_window.CaveViewerWindow, "cave_map_root")
 
 
 def test_pending_import_failure_suppresses_only_its_native_close_signal(monkeypatch):
     descriptor = {"format": "glb", "glb_path": "/maps/cave.glb"}
 
-    def fail_after_recording_outcome():
-        viewer_window.CaveViewerWindow.cave_session_outcome = (
-            viewer_window.ViewerSessionOutcome(
-                kind="import_failed",
-                message="cache build already active",
-                suggestion="wait, then retry",
-            )
+    def fail_after_recording_outcome(session):
+        session.record_outcome(
+            kind="import_failed",
+            message="cache build already active",
+            suggestion="wait, then retry",
         )
         raise SystemExit(1)
 
@@ -3174,10 +3218,8 @@ def test_pending_import_failure_suppresses_only_its_native_close_signal(monkeypa
         message="cache build already active",
         suggestion="wait, then retry",
     )
-    assert viewer_window.CaveViewerWindow.cave_pending_import is None
-    assert viewer_window.CaveViewerWindow.cave_session_outcome == (
-        viewer_window.ViewerSessionOutcome()
-    )
+    assert not hasattr(viewer_window.CaveViewerWindow, "cave_pending_import")
+    assert not hasattr(viewer_window.CaveViewerWindow, "cave_session_outcome")
 
 
 def test_pending_import_does_not_suppress_unrelated_native_exit(monkeypatch):
@@ -3185,7 +3227,7 @@ def test_pending_import_does_not_suppress_unrelated_native_exit(monkeypatch):
     monkeypatch.setattr(
         viewer_window,
         "_launch_viewer_window",
-        lambda: (_ for _ in ()).throw(SystemExit(7)),
+        lambda _session: (_ for _ in ()).throw(SystemExit(7)),
     )
 
     with pytest.raises(SystemExit) as raised:
@@ -3199,12 +3241,10 @@ def test_pending_import_failure_does_not_hide_an_unrelated_viewer_exception(
 ):
     descriptor = {"format": "glb", "glb_path": "/maps/cave.glb"}
 
-    def fail_after_recording_outcome():
-        viewer_window.CaveViewerWindow.cave_session_outcome = (
-            viewer_window.ViewerSessionOutcome(
-                kind="import_failed",
-                message="cache build already active",
-            )
+    def fail_after_recording_outcome(session):
+        session.record_outcome(
+            kind="import_failed",
+            message="cache build already active",
         )
         raise ValueError("renderer teardown failed")
 
@@ -3246,11 +3286,11 @@ def test_run_viewer_benchmark_records_scenario_and_cache_identity(tmp_path, monk
         lambda cache: {"cache": cache},
     )
 
-    def fake_launch(*, window_size_override=None):
+    def fake_launch(session, *, window_size_override=None):
         calls.append(
             (
                 window_size_override,
-                dict(viewer_window.CaveViewerWindow.cave_benchmark_config),
+                session.config.benchmark,
             )
         )
 
@@ -3266,12 +3306,12 @@ def test_run_viewer_benchmark_records_scenario_and_cache_identity(tmp_path, monk
     config = calls[0][1]
     assert summary_path == str(tmp_path / "out" / "summary.json")
     assert calls[0][0] is None
-    assert config["scenario"] is scenario
-    assert config["environment"]["scenario_fingerprint"] == "scenario-sha"
-    assert config["environment"]["cache_manifest_sha256"] == hashlib.sha256(
+    assert config.scenario is scenario
+    assert config.environment["scenario_fingerprint"] == "scenario-sha"
+    assert config.environment["cache_manifest_sha256"] == hashlib.sha256(
         manifest_bytes
     ).hexdigest()
-    assert config["environment"]["streaming_settings"] == {
+    assert config.environment["streaming_settings"] == {
         "render_distance_chunks": 4,
         "system_ram_target_percent": "12",
         "gpu_memory_target_percent": "65",
@@ -3283,8 +3323,8 @@ def test_run_viewer_benchmark_records_scenario_and_cache_identity(tmp_path, monk
         "upload_groups_per_frame": "7",
         "upload_time_budget_ms": "9.5",
     }
-    assert len(config["environment"]["streaming_settings_fingerprint"]) == 64
-    assert viewer_window.CaveViewerWindow.cave_benchmark_config is None
+    assert len(config.environment["streaming_settings_fingerprint"]) == 64
+    assert not hasattr(viewer_window.CaveViewerWindow, "cave_benchmark_config")
 
 
 def test_moderngl_runner_closes_and_destroys_window_on_keyboard_interrupt(monkeypatch):
@@ -4678,12 +4718,6 @@ def test_pending_import_splash_renders_logo_before_import_starts(monkeypatch):
                 )
             )
 
-    monkeypatch.setattr(
-        viewer_window.CaveViewerWindow,
-        "cave_pending_import",
-        {"model_descriptor": {"obj_path": "/maps/cave.obj"}},
-    )
-
     window = _import_window()
     window.wnd = SimpleNamespace(size=(800, 600), buffer_size=(820, 600))
     window.import_progress_panel = FakeImportProgressPanel()
@@ -4731,12 +4765,6 @@ def test_present_pending_import_splash_swaps_when_backend_supports_it(monkeypatc
                 )
             )
 
-    monkeypatch.setattr(
-        viewer_window.CaveViewerWindow,
-        "cave_pending_import",
-        {"model_descriptor": {"obj_path": "/maps/cave.obj"}},
-    )
-
     window = _import_window()
     window.wnd = SimpleNamespace(
         size=(800, 600),
@@ -4780,12 +4808,6 @@ def test_present_pending_import_splash_renders_without_swap_support(monkeypatch)
                     progress_session_id,
                 )
             )
-
-    monkeypatch.setattr(
-        viewer_window.CaveViewerWindow,
-        "cave_pending_import",
-        {"model_descriptor": {"obj_path": "/maps/cave.obj"}},
-    )
 
     window = _import_window()
     window.wnd = SimpleNamespace(size=(800, 600))
