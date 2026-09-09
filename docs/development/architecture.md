@@ -743,6 +743,12 @@ that launch's `ViewerSession`. A short-lived ModernGL configuration subclass
 binds the session to the class-based backend API, so the reusable
 `CaveViewerWindow` class never carries map, benchmark, runtime, or outcome
 state between native-window runs.
+`gui.viewer_workflow` is the session-scoped composition root for non-OpenGL
+workflow state. The window supplies an immutable snapshot of render-thread
+facts and executes the resulting frame/capture request; the coordinator owns
+controller identity, cross-capture priority, import and benchmark lifecycle
+references, and idempotent shutdown state. Backend callbacks remain on the
+window and all context-bound rendering and cleanup remain on the render thread.
 `gui.viewer_frame_scheduler` selects the iconified, capture-finalization,
 import, startup, or interactive frame phase and owns non-blocking throttles.
 `gui.viewer_capture_workflow` owns cross-capture exit finalization and overlay

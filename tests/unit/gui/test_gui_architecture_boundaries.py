@@ -25,10 +25,12 @@ UPDATE_PACKAGE_REVEAL_MODULE = GUI_PLATFORM_ROOT / "update_package_reveal.py"
 UPDATE_PACKAGE_STORAGE_MODULE = GUI_PLATFORM_ROOT / "update_package_storage.py"
 UPDATE_MANAGER_MODULE = GUI_ROOT / "update_manager.py"
 STANDARD_LIBRARY_MAPS_MODULE = GUI_ROOT / "standard_library_maps.py"
+VIEWER_WINDOW_MODULE = GUI_ROOT / "viewer_window.py"
 VIEWER_SESSION_COORDINATOR_MODULES = (
     GUI_ROOT / "viewer_action_dispatch.py",
     GUI_ROOT / "viewer_capture_workflow.py",
     GUI_ROOT / "viewer_frame_scheduler.py",
+    GUI_ROOT / "viewer_workflow.py",
 )
 APP_MODULE = "caveviewer.app"
 _LEGACY_STATIC_PRESENTATION_ACCESSORS = {
@@ -575,6 +577,48 @@ def test_viewer_session_coordinators_do_not_import_opengl():
                 violations.append(
                     Violation(path, node.lineno, f"imports OpenGL module {module}")
                 )
+
+    assert not violations, _format_violations(violations)
+
+
+def test_viewer_window_composes_non_gl_state_through_workflow_coordinator():
+    """Keep production controller identity on one session-scoped owner."""
+    viewer_module = _parse_module(VIEWER_WINDOW_MODULE)
+    initializer = _class_method(viewer_module, "CaveViewerWindow", "__init__")
+    assert initializer is not None
+
+    coordinator_assignments = _assignment_values(
+        initializer,
+        "_workflow_coordinator",
+    )
+    assert any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ViewerWorkflowCoordinator"
+        for expression in coordinator_assignments
+        for node in ast.walk(expression)
+    )
+
+    independently_owned_attributes = {
+        "_action_dispatcher",
+        "_artifact_capture_presentation",
+        "_capture_workflow",
+        "_frame_scheduler",
+        "_manual_dive_trace_controller",
+        "_map_opening_progress_session",
+        "_recording_controller",
+        "_slice_export_controller",
+        "_slice_selection_controller",
+    }
+    violations = [
+        Violation(
+            VIEWER_WINDOW_MODULE,
+            initializer.lineno,
+            f"constructs independent self.{attribute_name} in __init__",
+        )
+        for attribute_name in sorted(independently_owned_attributes)
+        if _assignment_values(initializer, attribute_name)
+    ]
 
     assert not violations, _format_violations(violations)
 
