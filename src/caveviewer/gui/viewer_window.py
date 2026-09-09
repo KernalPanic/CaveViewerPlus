@@ -111,6 +111,11 @@ from caveviewer.gui.viewer_session import (
     ViewerSessionConfig,
     ViewerSessionOutcome,
 )
+from caveviewer.gui.viewer_workflow import (
+    ViewerRenderRequest,
+    ViewerWorkflowCoordinator,
+    ViewerWorkflowSnapshot,
+)
 from caveviewer.gui.viewer_benchmark_composition import (
     environment_size as _benchmark_environment_size,
     streaming_settings_fingerprint as _benchmark_streaming_settings_fingerprint,
@@ -801,7 +806,7 @@ class CaveViewerWindow(mglw.WindowConfig):
                 "The viewer session has neither a ready cache nor a pending import."
             )
 
-        self._map_opening_progress_session = MapOpeningProgressSession()
+        self._workflow_coordinator = ViewerWorkflowCoordinator(session)
         self.import_progress_panel = None
         self._pending_import_splash_rendered = False
         if have_pending_import:
@@ -855,16 +860,12 @@ class CaveViewerWindow(mglw.WindowConfig):
             else viewer_settings.gpu_draw_timer
         )
         self._streaming_frame_timing: dict | None = None
-        self._benchmark_controller: BenchmarkController | None = None
         self._last_input_reset_log = 0.0
         self._layout_cache_size: tuple | None = None
         self._layout_cache_result: dict | None = None
         self._is_iconified = False
         self._is_background_paused = False
-        self._frame_scheduler = ViewerFrameScheduler()
         self._closing_requested = False
-        self._capture_workflow = ViewerCaptureWorkflow()
-        self._action_dispatcher = ViewerActionDispatcher()
         self._slice_reveal_before_close = False
         self._slice_reveal_output_path: str | None = None
         self._slice_source_cache_dir: str | None = None
@@ -897,10 +898,6 @@ class CaveViewerWindow(mglw.WindowConfig):
             manual_dive_trace.ManualDiveTraceRecorder | None
         ) = None
         self._manual_dive_trace_writers: list[_PendingManualDiveTraceWriter] = []
-        self._manual_dive_trace_controller = ManualDiveTraceStateController()
-        self._slice_selection_controller = SliceSelectionController()
-        self._slice_export_controller = SliceExportController()
-        self._artifact_capture_presentation = ArtifactCapturePresentationController()
         self._pending_recorded_dive_trace = (
             session_config.recorded_dive_trace
         )
@@ -934,8 +931,8 @@ class CaveViewerWindow(mglw.WindowConfig):
             self._recording_output_dir = os.path.expanduser(
                 viewer_settings.recording.directory
             )
-        self._recording_controller = RecordingStateController(
-            frame_interval=1.0 / float(self._recording_fps)
+        self._workflow_coordinator.recording.frame_interval = (
+            1.0 / float(self._recording_fps)
         )
         self._recording_session: recording.RecordingEncoderSession | None = None
         self._recording_output_path: str | None = None
@@ -968,14 +965,14 @@ class CaveViewerWindow(mglw.WindowConfig):
                     else _DEFAULT_WINDOW_SIZE,
                 )
             )
-            self._benchmark_controller = BenchmarkController(
+            benchmark_controller = BenchmarkController(
                 scenario=benchmark_config.scenario,
                 output_dir=benchmark_config.output_dir,
                 logger=_LOG,
                 perf_counter=lambda: time.perf_counter(),
                 environment=benchmark_config.environment,
             )
-            self._benchmark_controller.update_environment(
+            benchmark_controller.update_environment(
                 {
                     "gl_vendor": str(self.ctx.info.get("GL_VENDOR", "")),
                     "gl_renderer": str(self.ctx.info.get("GL_RENDERER", "")),
@@ -989,7 +986,10 @@ class CaveViewerWindow(mglw.WindowConfig):
                     "vsync": bool(getattr(self, "vsync", False)),
                 }
             )
-            self._benchmark_controller.prepare_output()
+            benchmark_controller.prepare_output()
+            self._workflow_coordinator.set_benchmark_controller(
+                benchmark_controller
+            )
 
         self._install_backend_modifier_probe()
 
@@ -1248,6 +1248,25 @@ class CaveViewerWindow(mglw.WindowConfig):
             getattr(self, "_platform_runtime", None)
         )
 
+    def _active_benchmark_controller(self) -> BenchmarkController | None:
+        """Return an injected test controller or the session-owned controller."""
+        controller = self.__dict__.get("_benchmark_controller")
+        if controller is not None:
+            return controller
+        workflows = self.__dict__.get("_workflow_coordinator")
+        return None if workflows is None else workflows.benchmark_controller
+
+    def _finish_benchmark(self, *, reason: str) -> bool:
+        """Finish benchmark output through its session lifecycle owner."""
+        workflows = self.__dict__.get("_workflow_coordinator")
+        if workflows is not None:
+            return workflows.finish_benchmark(reason=reason)
+        controller = self.__dict__.get("_benchmark_controller")
+        if controller is None or controller.finished:
+            return False
+        controller.finish(reason=reason)
+        return True
+
     def _acquire_import_inhibitor(self, map_name: str):
         """Use the runtime's shared desktop service for a map-import action."""
         runtime = getattr(self, "_platform_runtime", None)
@@ -1261,19 +1280,22 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _ensure_import_controller(self) -> MapImportController:
         controller = self.__dict__.get("_import_controller")
-        if controller is None:
-            runtime_settings = getattr(self, "_runtime_settings", None)
+        if controller is not None:
+            return controller
 
-            def launch_import_process(model_descriptor: dict, textures_dir: str):
-                if runtime_settings is None:
-                    return start_import_process(model_descriptor, textures_dir)
-                return start_import_process(
-                    model_descriptor,
-                    textures_dir,
-                    runtime_settings=runtime_settings.import_configuration(),
-                )
+        runtime_settings = getattr(self, "_runtime_settings", None)
 
-            controller = MapImportController(
+        def launch_import_process(model_descriptor: dict, textures_dir: str):
+            if runtime_settings is None:
+                return start_import_process(model_descriptor, textures_dir)
+            return start_import_process(
+                model_descriptor,
+                textures_dir,
+                runtime_settings=runtime_settings.import_configuration(),
+            )
+
+        def create_controller() -> MapImportController:
+            return MapImportController(
                 self,
                 logger=lambda: _LOG,
                 chunker=lambda: chunker,
@@ -1285,7 +1307,12 @@ class CaveViewerWindow(mglw.WindowConfig):
                 monotonic=lambda: time.monotonic(),
                 report_startup_failure=self._record_startup_import_failure,
             )
-            self.__dict__["_import_controller"] = controller
+
+        workflows = self.__dict__.get("_workflow_coordinator")
+        if workflows is not None:
+            return workflows.ensure_import_controller(create_controller)
+        controller = create_controller()
+        self.__dict__["_import_controller"] = controller
         return controller
 
     def _record_startup_import_failure(self, message: str, suggestion: str) -> None:
@@ -1299,57 +1326,135 @@ class CaveViewerWindow(mglw.WindowConfig):
     def _ensure_recording_controller(self) -> RecordingStateController:
         controller = self.__dict__.get("_recording_controller")
         if controller is None:
-            controller = RecordingStateController()
-            self.__dict__["_recording_controller"] = controller
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.recording
+            controller = self.__dict__.setdefault(
+                "_recording_controller",
+                RecordingStateController(),
+            )
         return controller
 
     def _ensure_frame_scheduler(self) -> ViewerFrameScheduler:
         """Return the non-GL frame phase and throttling coordinator."""
         scheduler = self.__dict__.get("_frame_scheduler")
         if scheduler is None:
-            scheduler = ViewerFrameScheduler()
-            self.__dict__["_frame_scheduler"] = scheduler
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.frame_scheduler
+            scheduler = self.__dict__.setdefault(
+                "_frame_scheduler",
+                ViewerFrameScheduler(),
+            )
         return scheduler
 
     def _ensure_capture_workflow(self) -> ViewerCaptureWorkflow:
         """Return the non-GL workflow shared by the capture controllers."""
         workflow = self.__dict__.get("_capture_workflow")
         if workflow is None:
-            workflow = ViewerCaptureWorkflow()
-            self.__dict__["_capture_workflow"] = workflow
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.capture
+            workflow = self.__dict__.setdefault(
+                "_capture_workflow",
+                ViewerCaptureWorkflow(),
+            )
         return workflow
 
     def _ensure_action_dispatcher(self) -> ViewerActionDispatcher:
         """Return the ordered key-action coordinator for this viewer session."""
         dispatcher = self.__dict__.get("_action_dispatcher")
         if dispatcher is None:
-            dispatcher = ViewerActionDispatcher()
-            self.__dict__["_action_dispatcher"] = dispatcher
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.actions
+            dispatcher = self.__dict__.setdefault(
+                "_action_dispatcher",
+                ViewerActionDispatcher(),
+            )
         return dispatcher
 
     def _ensure_manual_dive_trace_controller(self) -> ManualDiveTraceStateController:
         controller = self.__dict__.get("_manual_dive_trace_controller")
         if controller is None:
-            controller = ManualDiveTraceStateController()
-            self.__dict__["_manual_dive_trace_controller"] = controller
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.manual_dive_trace
+            controller = self.__dict__.setdefault(
+                "_manual_dive_trace_controller",
+                ManualDiveTraceStateController(),
+            )
         return controller
 
     def _ensure_slice_selection_controller(self) -> SliceSelectionController:
         controller = self.__dict__.get("_slice_selection_controller")
         if controller is None:
-            controller = SliceSelectionController()
-            self.__dict__["_slice_selection_controller"] = controller
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.slice_selection
+            controller = self.__dict__.setdefault(
+                "_slice_selection_controller",
+                SliceSelectionController(),
+            )
         return controller
 
     def _ensure_slice_export_controller(self) -> SliceExportController:
         controller = self.__dict__.get("_slice_export_controller")
         if controller is None:
-            controller = SliceExportController()
-            self.__dict__["_slice_export_controller"] = controller
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.slice_export
+            controller = self.__dict__.setdefault(
+                "_slice_export_controller",
+                SliceExportController(),
+            )
         return controller
+
+    def _workflow_snapshot(self) -> ViewerWorkflowSnapshot:
+        """Adapt render-thread state for the non-GL workflow coordinator."""
+        manual_trace = self._ensure_manual_dive_trace_controller()
+        slice_selection = self._ensure_slice_selection_controller()
+        slice_export = self._ensure_slice_export_controller()
+        recording_armed = self._recording_is_armed()
+        return ViewerWorkflowSnapshot(
+            setup_complete=bool(getattr(self, "_window_setup_complete", False)),
+            closing_requested=bool(getattr(self, "_closing_requested", False)),
+            iconified=bool(getattr(self, "_is_iconified", False)),
+            import_active=bool(getattr(self, "_import_active", False)),
+            map_loaded=bool(getattr(self, "_has_map_loaded", False)),
+            capture_close_pending=self._capture_close_pending(),
+            recording_owned=(
+                recording_armed or self._recording_stop_in_progress()
+            ),
+            recording_armed=recording_armed,
+            recording_active=(
+                getattr(self, "_recording_session", None) is not None
+            ),
+            manual_dive_trace_countdown_active=manual_trace.countdown_active,
+            manual_dive_trace_active=(
+                getattr(self, "_manual_dive_trace", None) is not None
+            ),
+            manual_dive_trace_finalizing=bool(
+                getattr(self, "_manual_dive_trace_writers", None)
+            ),
+            slice_countdown_active=slice_selection.countdown_active,
+            slice_selection_active=slice_selection.selection_active,
+            slice_saving=slice_selection.saving,
+            slice_export_active=slice_export.active,
+        )
+
+    def _workflow_render_request(self) -> ViewerRenderRequest | None:
+        """Return aggregate non-GL decisions for a production viewer session."""
+        workflows = self.__dict__.get("_workflow_coordinator")
+        if workflows is None:
+            return None
+        return workflows.render_request(self._workflow_snapshot())
 
     def _slice_work_pending(self) -> bool:
         """Return whether a countdown or child export needs a frame-time poll."""
+        request = self._workflow_render_request()
+        if request is not None:
+            return request.slice_work_pending
         selection = self.__dict__.get("_slice_selection_controller")
         exporter = self.__dict__.get("_slice_export_controller")
         return bool(
@@ -1358,6 +1463,9 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _slice_interaction_active(self) -> bool:
         """Return whether slice selection owns the capture interaction surface."""
+        request = self._workflow_render_request()
+        if request is not None:
+            return request.slice_interaction_active
         selection = self.__dict__.get("_slice_selection_controller")
         exporter = self.__dict__.get("_slice_export_controller")
         return bool(
@@ -1385,6 +1493,9 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _capture_owner(self) -> CaptureOwner | None:
         """Return the countdown, active capture, or finalizer owning capture."""
+        request = self._workflow_render_request()
+        if request is not None:
+            return request.capture_owner
         return self._ensure_capture_workflow().owner_for(
             self._capture_ownership_state()
         )
@@ -1424,6 +1535,9 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _active_capture_owner(self) -> CaptureOwner | None:
         """Return the owner that is actively collecting a video, trace, or slice."""
+        request = self._workflow_render_request()
+        if request is not None:
+            return request.active_capture_owner
         selection = self.__dict__.get("_slice_selection_controller")
         return self._ensure_capture_workflow().owner_for(
             CaptureOwnershipState(
@@ -1463,8 +1577,13 @@ class CaveViewerWindow(mglw.WindowConfig):
         """Return the shared post-save feedback and reveal scheduler."""
         controller = self.__dict__.get("_artifact_capture_presentation")
         if controller is None:
-            controller = ArtifactCapturePresentationController()
-            self.__dict__["_artifact_capture_presentation"] = controller
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.artifact_presentation
+            controller = self.__dict__.setdefault(
+                "_artifact_capture_presentation",
+                ArtifactCapturePresentationController(),
+            )
         return controller
 
     def _ensure_recording_capture(self) -> RecordingCaptureResources:
@@ -1847,7 +1966,7 @@ class CaveViewerWindow(mglw.WindowConfig):
                 f"Current {chunker.CHUNK_SIZE_ENV_VAR} setting is {configured_chunk_size:g}, "
                 "but existing/prebuilt caches stream using the chunk size recorded in manifest.json."
             )
-        benchmark_controller = getattr(self, "_benchmark_controller", None)
+        benchmark_controller = self._active_benchmark_controller()
         if benchmark_controller is not None:
             benchmark_radius = int(benchmark_controller.scenario.render_distance)
             clamped_radius = max(
@@ -2086,7 +2205,7 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _configure_benchmark_route_prefetch(self, origin: np.ndarray) -> None:
         """Ask streaming to keep the benchmark route tube wanted during startup."""
-        benchmark_controller = getattr(self, "_benchmark_controller", None)
+        benchmark_controller = self._active_benchmark_controller()
         world = getattr(self, "world", None)
         if benchmark_controller is None or world is None:
             return
@@ -2166,7 +2285,7 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _record_benchmark_streaming_environment(self) -> None:
         """Persist effective Streaming/texture settings for benchmark artifacts."""
-        benchmark_controller = getattr(self, "_benchmark_controller", None)
+        benchmark_controller = self._active_benchmark_controller()
         world = getattr(self, "world", None)
         if benchmark_controller is None or world is None:
             return
@@ -3802,6 +3921,9 @@ class CaveViewerWindow(mglw.WindowConfig):
         """Return the GUI-only presentation state for the active map open."""
         session = getattr(self, "_map_opening_progress_session", None)
         if session is None:
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                return workflows.map_opening
             session = MapOpeningProgressSession()
             self._map_opening_progress_session = session
         return session
@@ -5065,7 +5187,7 @@ class CaveViewerWindow(mglw.WindowConfig):
             route_prefetch_missing,
             route_prefetch_coverage_pct,
         )
-        benchmark_controller = getattr(self, "_benchmark_controller", None)
+        benchmark_controller = self._active_benchmark_controller()
         if benchmark_controller is not None:
             benchmark_controller.update_environment(
                 {
@@ -5528,6 +5650,9 @@ class CaveViewerWindow(mglw.WindowConfig):
         closing_requested = bool(getattr(self, "_closing_requested", False))
         if not setup_complete or closing_requested:
             return ViewerFramePhase.INACTIVE
+        request = self._workflow_render_request()
+        if request is not None:
+            return request.phase
         return self._ensure_frame_scheduler().phase_for(
             ViewerFrameState(
                 setup_complete=setup_complete,
@@ -5675,7 +5800,7 @@ class CaveViewerWindow(mglw.WindowConfig):
     ) -> None:
         """Render one interactive frame after non-GL session scheduling."""
         frame_start = time.perf_counter()
-        benchmark_controller = getattr(self, "_benchmark_controller", None)
+        benchmark_controller = self._active_benchmark_controller()
         benchmark_active = (
             benchmark_controller is not None
             and not benchmark_controller.finished
@@ -5790,7 +5915,7 @@ class CaveViewerWindow(mglw.WindowConfig):
         now = time.perf_counter()
         if not self._initial_chunks_loaded:
             if benchmark_active and benchmark_controller.exceeded_max_runtime(now):
-                benchmark_controller.finish(reason="max_runtime_exceeded")
+                self._finish_benchmark(reason="max_runtime_exceeded")
                 self.close()
                 return
             _map_name = os.path.basename(self.manifest.get("source_obj", "map"))
@@ -5806,7 +5931,7 @@ class CaveViewerWindow(mglw.WindowConfig):
 
         if self._chunk_prep_complete_until is not None and now < self._chunk_prep_complete_until:
             if benchmark_active and benchmark_controller.exceeded_max_runtime(now):
-                benchmark_controller.finish(reason="max_runtime_exceeded")
+                self._finish_benchmark(reason="max_runtime_exceeded")
                 self.close()
                 return
             _map_name = os.path.basename(self.manifest.get("source_obj", "map"))
@@ -5968,15 +6093,20 @@ class CaveViewerWindow(mglw.WindowConfig):
         recording_read_ms = 0.0
         recording_stage_ms = 0.0
         recording_drain_ms = 0.0
-        capture_overlay_mode = self._ensure_capture_workflow().overlay_mode_for(
-            CaptureOverlayState(
-                recording_armed=self._recording_hides_hud(),
-                manual_dive_trace_countdown_active=(
-                    self._ensure_manual_dive_trace_controller().countdown_active
-                ),
-                slice_countdown_active=(
-                    self._ensure_slice_selection_controller().countdown_active
-                ),
+        workflow_request = self._workflow_render_request()
+        capture_overlay_mode = (
+            workflow_request.capture_overlay_mode
+            if workflow_request is not None
+            else self._ensure_capture_workflow().overlay_mode_for(
+                CaptureOverlayState(
+                    recording_armed=self._recording_hides_hud(),
+                    manual_dive_trace_countdown_active=(
+                        self._ensure_manual_dive_trace_controller().countdown_active
+                    ),
+                    slice_countdown_active=(
+                        self._ensure_slice_selection_controller().countdown_active
+                    ),
+                )
             )
         )
         if capture_overlay_mode is CaptureOverlayMode.RECORDING:
@@ -6082,7 +6212,7 @@ class CaveViewerWindow(mglw.WindowConfig):
             benchmark_now = time.perf_counter()
             if not getattr(self, "_initial_visual_ready", False):
                 if benchmark_controller.exceeded_max_runtime(benchmark_now):
-                    benchmark_controller.finish(reason="max_runtime_exceeded")
+                    self._finish_benchmark(reason="max_runtime_exceeded")
                     self.close()
                 return
             if not benchmark_controller.started:
@@ -6105,11 +6235,11 @@ class CaveViewerWindow(mglw.WindowConfig):
                 streaming_timing=streaming_timing,
             )
             if benchmark_complete:
-                benchmark_controller.finish(reason="completed")
+                self._finish_benchmark(reason="completed")
                 self.close()
                 return
             if benchmark_controller.exceeded_max_runtime(benchmark_now):
-                benchmark_controller.finish(reason="max_runtime_exceeded")
+                self._finish_benchmark(reason="max_runtime_exceeded")
                 self.close()
                 return
 
@@ -7140,14 +7270,25 @@ class CaveViewerWindow(mglw.WindowConfig):
                 recording=lambda: self._handle_recording_hotkey(key, modifiers),
                 reset_view=lambda: self._handle_reset_view_shortcut(key, modifiers),
             )
-            if self._ensure_action_dispatcher().dispatch_key_press(actions):
+            workflows = self.__dict__.get("_workflow_coordinator")
+            action_handled = (
+                workflows.dispatch_key_press(actions)
+                if workflows is not None
+                else self._ensure_action_dispatcher().dispatch_key_press(actions)
+            )
+            if action_handled:
                 return
             self._keys_down.add(key)
         elif viewer_input.key_event_is_press_or_repeat(keys, action):
-            self._ensure_action_dispatcher().dispatch_key_repeat(
-                waiting_for_begin=self.controls_overlay.is_waiting_for_begin,
-                fly_speed=lambda: self._handle_fly_speed_hotkey(key, modifiers),
-            )
+            repeat_args = {
+                "waiting_for_begin": self.controls_overlay.is_waiting_for_begin,
+                "fly_speed": lambda: self._handle_fly_speed_hotkey(key, modifiers),
+            }
+            workflows = self.__dict__.get("_workflow_coordinator")
+            if workflows is not None:
+                workflows.dispatch_key_repeat(**repeat_args)
+            else:
+                self._ensure_action_dispatcher().dispatch_key_repeat(**repeat_args)
         elif action == keys.ACTION_RELEASE:
             self._keys_down.discard(key)
 
@@ -7699,36 +7840,43 @@ class CaveViewerWindow(mglw.WindowConfig):
 
     def _complete_window_close(self) -> None:
         """Release viewer resources after any active capture has finished."""
-        if self._closing_requested:
+        workflows = self.__dict__.get("_workflow_coordinator")
+        if workflows is not None:
+            if not workflows.begin_shutdown():
+                return
+        elif self._closing_requested:
             return
         self._closing_requested = True
-        self._ensure_capture_workflow().complete_close_workflows()
-        self._slice_reveal_before_close = False
-        self._slice_reveal_output_path = None
+        if workflows is None:
+            self._ensure_capture_workflow().complete_close_workflows()
+        try:
+            self._slice_reveal_before_close = False
+            self._slice_reveal_output_path = None
 
-        if hasattr(self, "wnd"):
-            try:
-                self.wnd.mouse_exclusivity = False
-            except Exception:
-                pass
+            if hasattr(self, "wnd"):
+                try:
+                    self.wnd.mouse_exclusivity = False
+                except Exception:
+                    pass
 
-        if getattr(self, "_import_active", False):
-            self._shutdown_active_import()
+            if getattr(self, "_import_active", False):
+                self._shutdown_active_import()
 
-        benchmark_controller = getattr(self, "_benchmark_controller", None)
-        if benchmark_controller is not None and not benchmark_controller.finished:
-            benchmark_controller.finish(reason="viewer_closed")
+            self._finish_benchmark(reason="viewer_closed")
 
-        if self._has_map_loaded:
-            self._teardown_current_map(final_shutdown=True)
-        self._release_window_resources()
+            if self._has_map_loaded:
+                self._teardown_current_map(final_shutdown=True)
+            self._release_window_resources()
 
-        # Ensure the backend window loop receives an explicit close request.
-        if hasattr(self, "wnd") and hasattr(self.wnd, "close"):
-            try:
-                self.wnd.close()
-            except Exception:
-                pass
+            # Ensure the backend window loop receives an explicit close request.
+            if hasattr(self, "wnd") and hasattr(self.wnd, "close"):
+                try:
+                    self.wnd.close()
+                except Exception:
+                    pass
+        finally:
+            if workflows is not None:
+                workflows.complete_shutdown()
 
     def on_close(self):
         if self._closing_requested:
