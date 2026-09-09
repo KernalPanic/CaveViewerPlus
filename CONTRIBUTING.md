@@ -101,10 +101,25 @@ commit coherent changes and push the topic branch:
 git push -u origin feature/descriptive-name
 ```
 
-Open a pull request against `main`. Describe the problem, solution, validation,
-known limitations, and remaining platform checks. If the work definition is a
-tracked review artifact, include its updates in the pull request; otherwise
-keep the ignored local copy current with the PR reference and status.
+Open a pull request against `main`. Every pull-request description must contain
+these sections, in this order, with relevant information in each:
+
+1. **Summary** - one concise, outcome-oriented description of the change.
+2. **Problem** - the concrete defect, risk, or maintenance cost addressed.
+3. **Solution** - what changed and the important architectural or behavioral
+   details.
+4. **Known limitations** - retained constraints, intentionally excluded
+   scope, or `None` when there are no known limitations.
+
+Do not add a **Validation** section or validation commands, test results, CI
+status, or platform-check results to the pull-request description. Keep that
+evidence in the work definition and rely on the pull request's checks for its
+current verification status. If the work definition is a tracked review
+artifact, include its updates in the pull request; otherwise keep the ignored
+local copy current with the PR reference and status.
+
+GitHub prepopulates the required headings from
+`.github/pull_request_template.md`.
 
 The pull request must be current with `main`, and its latest commit must pass
 all required GitHub checks. A result against an older base is not sufficient.

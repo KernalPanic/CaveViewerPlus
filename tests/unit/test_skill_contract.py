@@ -104,3 +104,24 @@ def test_work_cycle_skill_preserves_lifecycle_and_authorization_gates() -> None:
     assert "current request explicitly authorizes it" in normalized_work_cycle
     assert "skill activation alone is not" in normalized_work_cycle
     assert "$caveviewer-release" in normalized_work_cycle
+
+
+def test_work_cycle_skill_preserves_pull_request_description_contract() -> None:
+    work_cycle = (
+        SKILLS_ROOT / "caveviewer-work-cycle" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    normalized_work_cycle = " ".join(work_cycle.split())
+
+    for section_name in (
+        "**Summary**",
+        "**Problem**",
+        "**Solution**",
+        "**Known limitations**",
+    ):
+        assert section_name in normalized_work_cycle
+
+    assert "Do not include a **Validation** section" in normalized_work_cycle
+    assert (
+        "Keep verification evidence in the work definition"
+        in normalized_work_cycle
+    )
