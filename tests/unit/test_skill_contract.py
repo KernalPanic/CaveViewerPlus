@@ -104,3 +104,49 @@ def test_work_cycle_skill_preserves_lifecycle_and_authorization_gates() -> None:
     assert "current request explicitly authorizes it" in normalized_work_cycle
     assert "skill activation alone is not" in normalized_work_cycle
     assert "$caveviewer-release" in normalized_work_cycle
+
+
+def test_work_cycle_skill_preserves_pull_request_description_contract() -> None:
+    work_cycle = (
+        SKILLS_ROOT / "caveviewer-work-cycle" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    normalized_work_cycle = " ".join(work_cycle.split())
+
+    for section_name in (
+        "**Summary**",
+        "**Problem**",
+        "**Solution**",
+        "**Known limitations**",
+    ):
+        assert section_name in normalized_work_cycle
+
+    assert "Do not include a **Validation** section" in normalized_work_cycle
+    assert (
+        "Keep verification evidence in the work definition"
+        in normalized_work_cycle
+    )
+
+
+def test_work_cycle_skill_defines_branch_finalization_shorthand() -> None:
+    work_cycle = (
+        SKILLS_ROOT / "caveviewer-work-cycle" / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    normalized_work_cycle = " ".join(work_cycle.split())
+
+    assert (
+        "Finalize this branch through `origin/main` and clean up local and "
+        "remote topic branches"
+    ) in normalized_work_cycle
+    for lifecycle_step in (
+        "push the working branch to `origin` without force",
+        "open a pull request against `main`",
+        "wait for all required checks to pass and then merge",
+        "update the active master plan with the pull-request ID",
+        "delete the local and remote working topic branches",
+    ):
+        assert lifecycle_step in normalized_work_cycle
+
+    assert (
+        "Quoting, documenting, or asking about this instruction does not "
+        "execute or authorize the lifecycle"
+    ) in normalized_work_cycle

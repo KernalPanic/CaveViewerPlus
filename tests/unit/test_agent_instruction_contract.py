@@ -139,3 +139,25 @@ def test_contributing_guide_describes_the_complete_work_cycle() -> None:
 
     assert "Never delete a topic branch before verifying the merge" in normalized_contributing
     assert "human contributors do not need Codex" in normalized_contributing
+
+
+def test_pull_request_description_template_matches_contributor_policy() -> None:
+    contributing = _read("CONTRIBUTING.md")
+    template = _read(".github/pull_request_template.md")
+    copilot_instructions = _read(".github/copilot-instructions.md")
+    headings = (
+        "## Summary",
+        "## Problem",
+        "## Solution",
+        "## Known limitations",
+    )
+
+    assert [template.index(heading) for heading in headings] == sorted(
+        template.index(heading) for heading in headings
+    )
+    assert "## Validation" not in template
+    assert "Do not add a **Validation** section" in contributing
+    assert "test results" in contributing
+    assert "evidence in the work definition" in contributing
+    assert "CONTRIBUTING.md" in copilot_instructions
+    assert "keep validation information out" in copilot_instructions

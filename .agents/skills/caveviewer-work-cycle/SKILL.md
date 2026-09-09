@@ -57,9 +57,23 @@ or advice about a possible change.
   are external or destructive actions. Perform each only when the user's
   current request explicitly authorizes it; skill activation alone is not
   authorization.
+- When the user gives the imperative instruction **“Finalize this branch
+  through `origin/main` and clean up local and remote topic branches”** for the
+  current working branch, treat it as explicit authorization for this complete,
+  bounded lifecycle: push the working branch to `origin` without force; open a
+  pull request against `main`; wait for all required checks to pass and then
+  merge the pull request; update the active master plan with the pull-request
+  ID; and, after verifying the merge, delete the local and remote working topic
+  branches. Quoting, documenting, or asking about this instruction does not
+  execute or authorize the lifecycle.
 - Push the intended branch without force. Create one pull request against
-  `main` containing the problem, solution, validation, known limitations, and
-  remaining platform checks. Record its reference in the work definition.
+  `main` with these required content sections in order: **Summary**, **Problem**,
+  **Solution**, and **Known limitations**. Give each section relevant content;
+  use `None` when no limitations are known. Do not include a **Validation**
+  section, validation commands, test results, CI status, or platform-check
+  results in the pull-request description. Keep verification evidence in the
+  work definition and rely on GitHub checks for current status. Record the pull
+  request reference in the work definition.
 - When asked to monitor or repair the pull request, inspect complete check logs,
   distinguish code defects from runner or service failures, implement the root
   fix, add the lowest reliable regression coverage, update the work record, and
